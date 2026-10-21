@@ -139,6 +139,8 @@ type pageData struct {
 	ClientName    string
 	Scopes        []string
 	Error         string
+	Username      string
+	Password      string
 }
 
 var loginTemplate = template.Must(template.New("login").Parse(`<!doctype html>
@@ -146,9 +148,9 @@ var loginTemplate = template.Must(template.New("login").Parse(`<!doctype html>
 <style>body{font-family:system-ui,sans-serif;max-width:520px;margin:64px auto;padding:0 20px;color:#18201c}main{border:1px solid #aeb6b0;padding:28px}label{display:block;margin:14px 0 5px}input{box-sizing:border-box;width:100%;padding:10px}button{margin-top:20px;padding:10px 16px}.error{color:#a22}code{background:#eef0ed;padding:2px 5px}</style></head>
 <body><main><h1>登录并授权</h1><p>客户端 <strong>{{.ClientName}}</strong> 请求访问内存 MCP Server。</p>{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
 <form method="post" action="/oauth/login"><input type="hidden" name="transaction_id" value="{{.TransactionID}}"><input type="hidden" name="csrf" value="{{.CSRF}}">
-<label for="username">用户名</label><input id="username" name="username" autocomplete="username" required value="demo">
-<label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" required value="demo">
-<button type="submit">登录</button></form><p>教学账号：<code>demo / demo</code></p></main></body></html>`))
+<label for="username">用户名</label><input id="username" name="username" autocomplete="username" required value="{{.Username}}">
+<label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" required value="{{.Password}}">
+<button type="submit">登录</button></form><p>教学账号：<code>{{.Username}} / {{.Password}}</code></p></main></body></html>`))
 
 var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>授权确认</title>
@@ -174,7 +176,7 @@ func New(cfg Config) (*Server, error) {
 		cfg.DemoUsername = "demo"
 	}
 	if cfg.DemoPassword == "" {
-		cfg.DemoPassword = "demo"
+		cfg.DemoPassword = "oauth-demo"
 	}
 	if cfg.AccessTokenTTL == 0 {
 		cfg.AccessTokenTTL = time.Hour
@@ -698,7 +700,14 @@ func (s *Server) transaction(id, csrf string) (*authorizationTransaction, *clien
 func (s *Server) renderLogin(w http.ResponseWriter, tx *authorizationTransaction, c *client, message string) {
 	s.setPageHeaders(w)
 	w.WriteHeader(http.StatusOK)
-	_ = loginTemplate.Execute(w, pageData{TransactionID: tx.ID, CSRF: tx.CSRF, ClientName: c.Name, Error: message})
+	_ = loginTemplate.Execute(w, pageData{
+		TransactionID: tx.ID,
+		CSRF:          tx.CSRF,
+		ClientName:    c.Name,
+		Error:         message,
+		Username:      s.cfg.DemoUsername,
+		Password:      s.cfg.DemoPassword,
+	})
 }
 
 func (s *Server) renderConsent(w http.ResponseWriter, tx *authorizationTransaction, c *client) {

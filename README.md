@@ -56,7 +56,7 @@ Authorization Server 的教学账号是：
 
 ```text
 用户名：demo
-密码：demo
+密码：oauth-demo
 ```
 
 如果要改端口、issuer、共享密钥或上游地址，直接修改对应入口文件中的常量，然后重新启动相关服务即可。
@@ -70,7 +70,7 @@ codex mcp add memory-oauth-demo --url http://127.0.0.1:8080/mcp
 codex mcp login memory-oauth-demo
 ```
 
-浏览器打开授权页面后，使用 `demo / demo` 登录并点击“允许”。登录完成后调用：
+浏览器打开授权页面后，使用 `demo / oauth-demo` 登录并点击“允许”。登录完成后调用：
 
 ```text
 请调用 memory-oauth-demo 的 whoami 工具。

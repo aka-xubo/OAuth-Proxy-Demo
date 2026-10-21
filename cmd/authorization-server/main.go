@@ -20,7 +20,7 @@ const (
 	mcpResourceURL          = "http://127.0.0.1:8080/mcp"
 	introspectionSecret     = "local-dev-introspection-secret"
 	demoUsername            = "demo"
-	demoPassword            = "demo"
+	demoPassword            = "oauth-demo"
 	proxyClientID           = "memory-oauth-proxy"
 	proxyCallbackURL        = "http://127.0.0.1:8082/oauth/callback/upstream"
 )

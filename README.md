@@ -52,12 +52,15 @@ Proxy Introspection：         http://127.0.0.1:8082/oauth/introspect
 Upstream OAuth Server：       http://127.0.0.1:8081
 ```
 
-Authorization Server 的教学账号是：
+Authorization Server 在同一登录页按租户区分教学账号。登录表单有必填的租户字段，默认选择 `acme`，用户名和密码预填为 `demo`：
 
 ```text
-用户名：demo
-密码：demo
+租户 acme，用户名 demo，密码 demo
+租户 globex，用户名 demo，密码 demo
+租户 globex，用户名 ops，密码 ops
 ```
+
+同一个用户名可以同时存在于两个租户。登录成功后，Token 只绑定所选租户，用户标识为 `租户:用户名`，例如 `acme:demo`。
 
 如果要改端口、issuer、共享密钥或上游地址，直接修改对应入口文件中的常量，然后重新启动相关服务即可。
 
@@ -70,7 +73,7 @@ codex mcp add memory-oauth-demo --url http://127.0.0.1:8080/mcp
 codex mcp login memory-oauth-demo
 ```
 
-浏览器打开授权页面后，使用 `demo / demo` 登录并点击“允许”。登录完成后调用：
+浏览器打开授权页面后，选择租户并使用上面的教学账号登录，然后点击“允许”。登录完成后调用：
 
 ```text
 请调用 memory-oauth-demo 的 whoami 工具。

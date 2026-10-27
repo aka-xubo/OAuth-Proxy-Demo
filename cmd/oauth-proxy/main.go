@@ -20,6 +20,7 @@ const (
 	mcpResourceURL       = "http://127.0.0.1:8080/mcp"
 	upstreamAuthorizeURL = "http://127.0.0.1:8081/oauth/authorize"
 	upstreamTokenURL     = "http://127.0.0.1:8081/oauth/token"
+	upstreamUserinfoURL  = "http://127.0.0.1:8081/userinfo"
 	upstreamClientID     = "memory-oauth-proxy"
 	upstreamClientSecret = ""
 	upstreamRedirectURI  = "http://127.0.0.1:8082/oauth/callback/upstream"
@@ -36,6 +37,7 @@ func main() {
 		Resource:             resource,
 		UpstreamAuthorizeURL: upstreamAuthorizeURL,
 		UpstreamTokenURL:     upstreamTokenURL,
+		UpstreamUserinfoURL:  upstreamUserinfoURL,
 		UpstreamClientID:     upstreamClientID,
 		UpstreamClientSecret: upstreamClientSecret,
 		UpstreamRedirectURI:  upstreamRedirectURI,

@@ -19,8 +19,6 @@ const (
 	authorizationServerURL  = "http://127.0.0.1:8081"
 	mcpResourceURL          = "http://127.0.0.1:8080/mcp"
 	introspectionSecret     = "local-dev-introspection-secret"
-	demoUsername            = "demo"
-	demoPassword            = "demo"
 	proxyClientID           = "memory-oauth-proxy"
 	proxyCallbackURL        = "http://127.0.0.1:8082/oauth/callback/upstream"
 )
@@ -35,8 +33,11 @@ func main() {
 		Issuer:              issuer,
 		Resource:            resource,
 		IntrospectionSecret: secret,
-		DemoUsername:        demoUsername,
-		DemoPassword:        demoPassword,
+		Accounts: []oauthserver.Account{
+			{TenantID: "acme", Username: "demo", Password: "demo"},
+			{TenantID: "globex", Username: "demo", Password: "demo"},
+			{TenantID: "globex", Username: "ops", Password: "ops"},
+		},
 		StaticClients: []oauthserver.StaticClient{{
 			ID: proxyClientID, Name: "Local OAuth Proxy",
 			RedirectURIs: []string{proxyCallbackURL},

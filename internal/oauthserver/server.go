@@ -26,12 +26,17 @@ import (
 
 var supportedScopes = []string{"openid", "profile", "email", "offline_access", "mcp:tools"}
 
+type Account struct {
+	TenantID string
+	Username string
+	Password string
+}
+
 type Config struct {
 	Issuer              string
 	Resource            string
 	IntrospectionSecret string
-	DemoUsername        string
-	DemoPassword        string
+	Accounts            []Account
 	StaticClients       []StaticClient
 	AccessTokenTTL      time.Duration
 	RefreshTokenTTL     time.Duration
@@ -56,6 +61,8 @@ type Server struct {
 	rng io.Reader
 
 	mu            sync.Mutex
+	accounts      map[string]Account
+	tenants       []string
 	clients       map[string]*client
 	transactions  map[string]*authorizationTransaction
 	codes         map[string]*authorizationCode
@@ -84,6 +91,7 @@ type authorizationTransaction struct {
 	Resource      string
 	CodeChallenge string
 	UserID        string
+	TenantID      string
 	ExpiresAt     time.Time
 }
 
@@ -94,6 +102,7 @@ type authorizationCode struct {
 	Resource      string
 	CodeChallenge string
 	UserID        string
+	TenantID      string
 	ExpiresAt     time.Time
 }
 
@@ -102,6 +111,7 @@ type accessToken struct {
 	Scope     []string
 	Resource  string
 	UserID    string
+	TenantID  string
 	ExpiresAt time.Time
 }
 
@@ -110,6 +120,7 @@ type refreshToken struct {
 	Scope     []string
 	Resource  string
 	UserID    string
+	TenantID  string
 	ExpiresAt time.Time
 }
 
@@ -139,16 +150,18 @@ type pageData struct {
 	ClientName    string
 	Scopes        []string
 	Error         string
+	Tenants       []string
 }
 
 var loginTemplate = template.Must(template.New("login").Parse(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录内存 OAuth Server</title>
-<style>body{font-family:system-ui,sans-serif;max-width:520px;margin:64px auto;padding:0 20px;color:#18201c}main{border:1px solid #aeb6b0;padding:28px}label{display:block;margin:14px 0 5px}input{box-sizing:border-box;width:100%;padding:10px}button{margin-top:20px;padding:10px 16px}.error{color:#a22}code{background:#eef0ed;padding:2px 5px}</style></head>
+<style>body{font-family:system-ui,sans-serif;max-width:520px;margin:64px auto;padding:0 20px;color:#18201c}main{border:1px solid #aeb6b0;padding:28px}label{display:block;margin:14px 0 5px}input,select{box-sizing:border-box;width:100%;padding:10px}button{margin-top:20px;padding:10px 16px}.error{color:#a22}code{background:#eef0ed;padding:2px 5px}</style></head>
 <body><main><h1>登录并授权</h1><p>客户端 <strong>{{.ClientName}}</strong> 请求访问内存 MCP Server。</p>{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
 <form method="post" action="/oauth/login"><input type="hidden" name="transaction_id" value="{{.TransactionID}}"><input type="hidden" name="csrf" value="{{.CSRF}}">
+<label for="tenant">租户</label><select id="tenant" name="tenant" required>{{range .Tenants}}<option value="{{.}}"{{if eq . "acme"}} selected{{end}}>{{.}}</option>{{end}}</select>
 <label for="username">用户名</label><input id="username" name="username" autocomplete="username" required value="demo">
 <label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" required value="demo">
-<button type="submit">登录</button></form><p>教学账号：<code>demo / demo</code></p></main></body></html>`))
+<button type="submit">登录</button></form><p>教学账号按租户隔离，默认 <code>acme / demo / demo</code>。</p></main></body></html>`))
 
 var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>授权确认</title>
@@ -170,12 +183,6 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("invalid resource %q", cfg.Resource)
 	}
 	cfg.Issuer = strings.TrimRight(cfg.Issuer, "/")
-	if cfg.DemoUsername == "" {
-		cfg.DemoUsername = "demo"
-	}
-	if cfg.DemoPassword == "" {
-		cfg.DemoPassword = "demo"
-	}
 	if cfg.AccessTokenTTL == 0 {
 		cfg.AccessTokenTTL = time.Hour
 	}
@@ -197,6 +204,9 @@ func New(cfg Config) (*Server, error) {
 		codes:         make(map[string]*authorizationCode),
 		accessTokens:  make(map[string]*accessToken),
 		refreshTokens: make(map[string]*refreshToken),
+	}
+	if err := server.loadAccounts(cfg.Accounts); err != nil {
+		return nil, err
 	}
 	for _, static := range cfg.StaticClients {
 		if static.ID == "" || len(static.RedirectURIs) == 0 {
@@ -238,6 +248,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /oauth/consent", s.handleConsent)
 	mux.HandleFunc("POST /oauth/token", s.handleToken)
 	mux.HandleFunc("POST /oauth/introspect", s.handleIntrospection)
+	mux.HandleFunc("GET /userinfo", s.handleUserinfo)
 }
 
 func (s *Server) ResourceMetadataURL() string {
@@ -253,6 +264,7 @@ func (s *Server) handleAuthorizationServerMetadata(w http.ResponseWriter, _ *htt
 		"issuer":                                s.cfg.Issuer,
 		"authorization_endpoint":                s.cfg.Issuer + "/oauth/authorize",
 		"token_endpoint":                        s.cfg.Issuer + "/oauth/token",
+		"userinfo_endpoint":                     s.cfg.Issuer + "/userinfo",
 		"registration_endpoint":                 s.cfg.Issuer + "/oauth/register",
 		"response_types_supported":              []string{"code"},
 		"response_modes_supported":              []string{"query"},
@@ -423,17 +435,20 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "authorization transaction is invalid or expired")
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(r.Form.Get("username")), []byte(s.cfg.DemoUsername)) != 1 ||
-		subtle.ConstantTimeCompare([]byte(r.Form.Get("password")), []byte(s.cfg.DemoPassword)) != 1 {
-		s.renderLogin(w, tx, c, "用户名或密码错误")
+	account, ok := s.authenticate(r.Form.Get("tenant"), r.Form.Get("username"), r.Form.Get("password"))
+	if !ok {
+		s.renderLogin(w, tx, c, "登录失败")
 		return
 	}
+	userID := account.TenantID + ":" + account.Username
 	s.mu.Lock()
 	if current, exists := s.transactions[tx.ID]; exists {
-		current.UserID = s.cfg.DemoUsername
+		current.UserID = userID
+		current.TenantID = account.TenantID
 	}
 	s.mu.Unlock()
-	tx.UserID = s.cfg.DemoUsername
+	tx.UserID = userID
+	tx.TenantID = account.TenantID
 	slog.Info("oauth authorization transaction user bound", "tx_fp", fingerprint(tx.ID))
 	s.renderConsent(w, tx, c)
 }
@@ -472,6 +487,7 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 		Resource:      tx.Resource,
 		CodeChallenge: tx.CodeChallenge,
 		UserID:        tx.UserID,
+		TenantID:      tx.TenantID,
 		ExpiresAt:     s.now().Add(s.cfg.CodeTTL),
 	}
 	s.mu.Lock()
@@ -528,6 +544,7 @@ func (s *Server) handleIntrospection(w http.ResponseWriter, r *http.Request) {
 		"resource":  info.Extra["resource"],
 		"scope":     strings.Join(info.Scopes, " "),
 		"user_id":   info.UserID,
+		"tenant_id": info.Extra["tenant_id"],
 		"exp":       info.Expiration.Unix(),
 	})
 }
@@ -536,6 +553,69 @@ func (s *Server) validIntrospectionRequest(r *http.Request) bool {
 	scheme, value, ok := strings.Cut(r.Header.Get("Authorization"), " ")
 	return ok && strings.EqualFold(scheme, "Bearer") &&
 		subtle.ConstantTimeCompare([]byte(value), []byte(s.cfg.IntrospectionSecret)) == 1
+}
+
+func (s *Server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
+	scheme, raw, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") || raw == "" {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "bearer access token is required")
+		return
+	}
+	info, err := s.VerifyAccessToken(r.Context(), raw, r)
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "access token is invalid or expired")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sub":       info.UserID,
+		"user_id":   info.UserID,
+		"tenant_id": info.Extra["tenant_id"],
+	})
+}
+
+func (s *Server) loadAccounts(accounts []Account) error {
+	if len(accounts) == 0 {
+		accounts = []Account{
+			{TenantID: "acme", Username: "demo", Password: "demo"},
+			{TenantID: "globex", Username: "demo", Password: "demo"},
+		}
+	}
+	s.accounts = make(map[string]Account, len(accounts))
+	seen := make(map[string]bool, len(accounts))
+	for _, account := range accounts {
+		if account.TenantID == "" || account.Username == "" || account.Password == "" {
+			return errors.New("account must have a tenant id, username, and password")
+		}
+		key := accountKey(account.TenantID, account.Username)
+		if _, exists := s.accounts[key]; exists {
+			return fmt.Errorf("duplicate account %s:%s", account.TenantID, account.Username)
+		}
+		s.accounts[key] = account
+		if !seen[account.TenantID] {
+			seen[account.TenantID] = true
+			s.tenants = append(s.tenants, account.TenantID)
+		}
+	}
+	return nil
+}
+
+func (s *Server) authenticate(tenantID, username, password string) (Account, bool) {
+	account, found := s.accounts[accountKey(tenantID, username)]
+	secret := []byte(account.Password)
+	if !found {
+		secret = make([]byte, len(password))
+	}
+	passwordMatch := subtle.ConstantTimeCompare([]byte(password), secret) == 1
+	if !found || !passwordMatch {
+		return Account{}, false
+	}
+	return account, true
+}
+
+func accountKey(tenantID, username string) string {
+	return tenantID + "\x00" + username
 }
 
 func (s *Server) exchangeAuthorizationCode(w http.ResponseWriter, r *http.Request) {
@@ -564,7 +644,7 @@ func (s *Server) exchangeAuthorizationCode(w http.ResponseWriter, r *http.Reques
 		writeTokenError(w, "invalid_grant", "PKCE verification failed")
 		return
 	}
-	response, err := s.issueTokens(code.ClientID, code.UserID, code.Scope, code.Resource)
+	response, err := s.issueTokens(code.ClientID, code.UserID, code.TenantID, code.Scope, code.Resource)
 	if err != nil {
 		http.Error(w, "failed to issue token", http.StatusInternalServerError)
 		return
@@ -592,7 +672,7 @@ func (s *Server) exchangeRefreshToken(w http.ResponseWriter, r *http.Request) {
 		writeTokenError(w, "invalid_target", "resource does not match refresh token")
 		return
 	}
-	response, err := s.issueTokens(token.ClientID, token.UserID, token.Scope, token.Resource)
+	response, err := s.issueTokens(token.ClientID, token.UserID, token.TenantID, token.Scope, token.Resource)
 	if err != nil {
 		http.Error(w, "failed to issue token", http.StatusInternalServerError)
 		return
@@ -600,7 +680,7 @@ func (s *Server) exchangeRefreshToken(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) issueTokens(clientID, userID string, scopes []string, resource string) (map[string]any, error) {
+func (s *Server) issueTokens(clientID, userID, tenantID string, scopes []string, resource string) (map[string]any, error) {
 	accessRaw, err := s.randomValue("at", 32)
 	if err != nil {
 		return nil, err
@@ -611,6 +691,7 @@ func (s *Server) issueTokens(clientID, userID string, scopes []string, resource 
 		Scope:     slices.Clone(scopes),
 		Resource:  resource,
 		UserID:    userID,
+		TenantID:  tenantID,
 		ExpiresAt: now.Add(s.cfg.AccessTokenTTL),
 	}
 	response := map[string]any{
@@ -632,6 +713,7 @@ func (s *Server) issueTokens(clientID, userID string, scopes []string, resource 
 			Scope:     slices.Clone(scopes),
 			Resource:  resource,
 			UserID:    userID,
+			TenantID:  tenantID,
 			ExpiresAt: now.Add(s.cfg.RefreshTokenTTL),
 		}
 		s.mu.Lock()
@@ -660,6 +742,7 @@ func (s *Server) VerifyAccessToken(_ context.Context, raw string, _ *http.Reques
 		Extra: map[string]any{
 			"client_id": token.ClientID,
 			"resource":  token.Resource,
+			"tenant_id": token.TenantID,
 		},
 	}, nil
 }
@@ -698,7 +781,7 @@ func (s *Server) transaction(id, csrf string) (*authorizationTransaction, *clien
 func (s *Server) renderLogin(w http.ResponseWriter, tx *authorizationTransaction, c *client, message string) {
 	s.setPageHeaders(w)
 	w.WriteHeader(http.StatusOK)
-	_ = loginTemplate.Execute(w, pageData{TransactionID: tx.ID, CSRF: tx.CSRF, ClientName: c.Name, Error: message})
+	_ = loginTemplate.Execute(w, pageData{TransactionID: tx.ID, CSRF: tx.CSRF, ClientName: c.Name, Error: message, Tenants: s.tenants})
 }
 
 func (s *Server) renderConsent(w http.ResponseWriter, tx *authorizationTransaction, c *client) {

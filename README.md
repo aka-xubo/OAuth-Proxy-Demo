@@ -4,7 +4,7 @@
 
 ```text
 Codex -> MCP Server -> OAuth Proxy A -> Authorization Server B
-                                      （本地内存 Authorization Server）
+                                      （本地 Authorization Server，SQLite 账号存储）
 ```
 
 项目包含三个相互独立的服务：
@@ -17,7 +17,7 @@ Codex -> MCP Server -> OAuth Proxy A -> Authorization Server B
 
 三个服务没有共享业务 Go 类库依赖。MCP Server 通过 HTTP 调用 OAuth Proxy 的 introspection 接口验证 Bearer Token。
 
-这是内存级教学实现：client、授权事务、authorization code、Token 和 introspection 映射都不持久化，进程重启后需要重新登录。
+这是本地教学实现：登录账号保存在 SQLite 中；client、授权事务、authorization code、access/refresh Token、代理映射和 MCP 计数器仍在内存中，进程重启后需要重新登录。
 
 ## 直接启动
 
@@ -61,6 +61,16 @@ Authorization Server 在同一登录页按租户区分教学账号。登录表�
 ```
 
 同一个用户名可以同时存在于两个租户。登录成功后，Token 只绑定所选租户，用户标识为 `租户:用户名`，例如 `acme:demo`。
+
+### 账号数据库
+
+Authorization Server 使用当前工作目录下的 `./oauth-users.db`（入口常量 `accountDatabasePath`）。纯 Go SQLite 驱动会自动创建数据库，不需要外部数据库服务、系统 SQLite 或额外配置。数据库及其 journal/WAL/SHM 文件已加入 `.gitignore`。
+
+首次初始化时，数据库结构、上述三个教学账号和初始化标记在同一事务中写入。仅存储租户标识、用户名和 bcrypt 密码哈希，不存储明文密码。每次登录都查询数据库，租户下拉列表也按数据库中现存租户排序生成。
+
+后续启动使用已有数据库，不会重新添加账号或覆盖密码哈希；数据库中的密码修改、新增账号和账号删除都会保留，即使删除全部账号也不会重新播种。修改入口的 `Accounts` 只影响新数据库。代码中未提供 `Accounts` 时，新数据库默认初始化 `acme/demo/demo` 和 `globex/demo/demo` 两个账号。测试通过 `oauthserver.Config.DatabasePath` 使用隔离的临时数据库。
+
+从同一工作目录再次执行 `go run ./cmd/authorization-server` 即可复用账号，并重新完成 HTTP 登录和授权。数据库初始化失败会阻止启动；请求时数据库不可用会返回通用服务器错误，不会使用内置账号回退。正常退出时，HTTP 服务先完成优雅关闭，再释放数据库连接。
 
 如果要改端口、issuer、共享密钥或上游地址，直接修改对应入口文件中的常量，然后重新启动相关服务即可。
 
@@ -186,7 +196,7 @@ internal/mcpserver        # 仅 MCP Server 使用，通过 HTTP introspection �
 
 这是教学实现，不应直接部署到生产环境：
 
-- 账号、client、授权事务和 Token 都在内存中，没有持久化或集群共享。
+- 账号仅持久化到本地 SQLite，没有集群共享；client、授权事务和 Token 等 OAuth 状态仍在内存中。
 - DCR 是开放接口，没有 initial access token、软件声明或速率限制。
 - 使用本地 HTTP 和固定共享密钥，只适合 loopback 开发环境。
 - 没有 MFA、账户锁定、撤销端点、审计日志和管理后台。

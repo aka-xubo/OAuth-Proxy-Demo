@@ -22,14 +22,12 @@ import (
 	"time"
 
 	mcpauth "github.com/modelcontextprotocol/go-sdk/auth"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var supportedScopes = []string{"openid", "profile", "email", "offline_access", "mcp:tools"}
 
-const (
-	genericLoginError = "登录信息不正确"
-	dummyPassword     = "dummy-password-not-a-real-account"
-)
+const genericLoginError = "登录信息不正确"
 
 type Account struct {
 	TenantID string
@@ -42,11 +40,13 @@ type Config struct {
 	Resource            string
 	IntrospectionSecret string
 	Accounts            []Account
-	StaticClients       []StaticClient
-	AccessTokenTTL      time.Duration
-	RefreshTokenTTL     time.Duration
-	CodeTTL             time.Duration
-	TransactionTTL      time.Duration
+	// DatabasePath selects the local account database; empty uses DefaultDatabasePath.
+	DatabasePath    string
+	StaticClients   []StaticClient
+	AccessTokenTTL  time.Duration
+	RefreshTokenTTL time.Duration
+	CodeTTL         time.Duration
+	TransactionTTL  time.Duration
 }
 
 // StaticClient 是服务启动时预置的 OAuth 客户端，适合代理等不支持 DCR 的调用方。
@@ -66,19 +66,12 @@ type Server struct {
 	rng io.Reader
 
 	mu            sync.Mutex
-	accounts      map[string]account
-	tenantIDs     []string
+	accountStore  *accountStore
 	clients       map[string]*client
 	transactions  map[string]*authorizationTransaction
 	codes         map[string]*authorizationCode
 	accessTokens  map[string]*accessToken
 	refreshTokens map[string]*refreshToken
-}
-
-type account struct {
-	TenantID string
-	Username string
-	Password string
 }
 
 type client struct {
@@ -194,11 +187,11 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("invalid resource %q", cfg.Resource)
 	}
 	cfg.Issuer = strings.TrimRight(cfg.Issuer, "/")
-	accounts, tenantIDs, err := normalizeAccounts(cfg.Accounts)
-	if err != nil {
-		return nil, err
-	}
+	bootstrap := cfg.Accounts
 	cfg.Accounts = nil
+	if cfg.DatabasePath == "" {
+		cfg.DatabasePath = DefaultDatabasePath
+	}
 	if cfg.AccessTokenTTL == 0 {
 		cfg.AccessTokenTTL = time.Hour
 	}
@@ -215,8 +208,6 @@ func New(cfg Config) (*Server, error) {
 		cfg:           cfg,
 		now:           time.Now,
 		rng:           rand.Reader,
-		accounts:      accounts,
-		tenantIDs:     tenantIDs,
 		clients:       make(map[string]*client),
 		transactions:  make(map[string]*authorizationTransaction),
 		codes:         make(map[string]*authorizationCode),
@@ -252,7 +243,16 @@ func New(cfg Config) (*Server, error) {
 			server.clients[static.ID].Name = "Static OAuth Client"
 		}
 	}
+	server.accountStore, err = openAccountStore(context.Background(), cfg.DatabasePath, bootstrap)
+	if err != nil {
+		return nil, err
+	}
 	return server, nil
+}
+
+// Close releases the account database after HTTP requests have finished.
+func (s *Server) Close() error {
+	return s.accountStore.db.Close()
 }
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
@@ -436,7 +436,7 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	s.transactions[tx.ID] = tx
 	s.mu.Unlock()
 	slog.Info("oauth authorization transaction created", "tx_fp", fingerprint(tx.ID), "client_fp", fingerprint(tx.ClientID))
-	s.renderLogin(w, tx, c, "")
+	s.renderLogin(w, r, tx, c, "")
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -449,9 +449,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "authorization transaction is invalid or expired")
 		return
 	}
-	account, ok := s.authenticate(r.Form.Get("tenant"), r.Form.Get("username"), r.Form.Get("password"))
+	account, ok, err := s.authenticate(r.Context(), r.Form.Get("tenant"), r.Form.Get("username"), r.Form.Get("password"))
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	if !ok {
-		s.renderLogin(w, tx, c, genericLoginError)
+		s.renderLogin(w, r, tx, c, genericLoginError)
 		return
 	}
 	userID := account.TenantID + ":" + account.Username
@@ -478,7 +482,7 @@ func (s *Server) handleConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if tx.UserID == "" {
-		s.renderLogin(w, tx, c, "本次授权事务尚未完成登录，请重新登录后再确认授权")
+		s.renderLogin(w, r, tx, c, "本次授权事务尚未完成登录，请重新登录后再确认授权")
 		return
 	}
 	s.mu.Lock()
@@ -735,63 +739,23 @@ func (s *Server) VerifyAccessToken(_ context.Context, raw string, _ *http.Reques
 	}, nil
 }
 
-func (s *Server) authenticate(tenantID, username, password string) (account, bool) {
-	s.mu.Lock()
-	found, ok := s.accounts[accountKey(tenantID, username)]
-	s.mu.Unlock()
-	expected := dummyPassword
+func (s *Server) authenticate(ctx context.Context, tenantID, username, password string) (account, bool, error) {
+	found, ok, err := s.accountStore.lookup(ctx, tenantID, username)
+	if err != nil {
+		return account{}, false, err
+	}
+	expected := s.accountStore.dummyHash
 	if ok {
-		expected = found.Password
+		expected = found.PasswordHash
 	}
-	if !passwordsMatch(password, expected) || !ok {
-		return account{}, false
+	err = bcrypt.CompareHashAndPassword(expected, []byte(password))
+	if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) || (err == nil && !ok) {
+		return account{}, false, nil
 	}
-	return found, true
-}
-
-func passwordsMatch(got, expected string) bool {
-	gotSum := sha256.Sum256([]byte(got))
-	expectedSum := sha256.Sum256([]byte(expected))
-	return subtle.ConstantTimeCompare(gotSum[:], expectedSum[:]) == 1
-}
-
-func normalizeAccounts(configured []Account) (map[string]account, []string, error) {
-	if len(configured) == 0 {
-		configured = defaultAccounts()
+	if err != nil {
+		return account{}, false, err
 	}
-	stored := make(map[string]account, len(configured))
-	seenTenant := make(map[string]struct{}, len(configured))
-	tenantIDs := make([]string, 0, len(configured))
-	for _, item := range configured {
-		if item.TenantID == "" || item.Username == "" || item.Password == "" {
-			return nil, nil, errors.New("account tenant, username, and password are required")
-		}
-		if strings.Contains(item.TenantID, ":") || strings.Contains(item.Username, ":") || strings.ContainsAny(item.TenantID, " \t\r\n") || strings.ContainsAny(item.Username, " \t\r\n") {
-			return nil, nil, errors.New("account tenant and username must not contain ':' or whitespace")
-		}
-		key := accountKey(item.TenantID, item.Username)
-		if _, exists := stored[key]; exists {
-			return nil, nil, fmt.Errorf("duplicate account %s:%s", item.TenantID, item.Username)
-		}
-		stored[key] = account{TenantID: item.TenantID, Username: item.Username, Password: item.Password}
-		if _, seen := seenTenant[item.TenantID]; !seen {
-			seenTenant[item.TenantID] = struct{}{}
-			tenantIDs = append(tenantIDs, item.TenantID)
-		}
-	}
-	slices.Sort(tenantIDs)
-	return stored, tenantIDs, nil
-}
-
-func defaultAccounts() []Account {
-	return []Account{
-		{TenantID: "acme", Username: "demo", Password: "demo"},
-		{TenantID: "globex", Username: "demo", Password: "demo"},
-	}
-}
-
-func accountKey(tenantID, username string) string {
-	return tenantID + "\x00" + username
+	return found, true, nil
 }
 
 func (s *Server) transaction(id, csrf string) (*authorizationTransaction, *client, bool) {
@@ -825,10 +789,15 @@ func (s *Server) transaction(id, csrf string) (*authorizationTransaction, *clien
 	return &copyTx, &copyClient, true
 }
 
-func (s *Server) renderLogin(w http.ResponseWriter, tx *authorizationTransaction, c *client, message string) {
+func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, tx *authorizationTransaction, c *client, message string) {
+	tenants, err := s.accountStore.tenants(r.Context())
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	s.setPageHeaders(w)
 	w.WriteHeader(http.StatusOK)
-	_ = loginTemplate.Execute(w, pageData{TransactionID: tx.ID, CSRF: tx.CSRF, ClientName: c.Name, Tenants: s.tenantIDs, Error: message})
+	_ = loginTemplate.Execute(w, pageData{TransactionID: tx.ID, CSRF: tx.CSRF, ClientName: c.Name, Tenants: tenants, Error: message})
 }
 
 func (s *Server) renderConsent(w http.ResponseWriter, tx *authorizationTransaction, c *client) {

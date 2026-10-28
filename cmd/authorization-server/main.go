@@ -21,9 +21,17 @@ const (
 	introspectionSecret     = "local-dev-introspection-secret"
 	proxyClientID           = "memory-oauth-proxy"
 	proxyCallbackURL        = "http://127.0.0.1:8082/oauth/callback/upstream"
+	accountDatabasePath     = "./oauth-users.db"
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("authorization server", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	addr := authorizationServerAddr
 	issuer := authorizationServerURL
 	resource := mcpResourceURL
@@ -33,6 +41,7 @@ func main() {
 		Issuer:              issuer,
 		Resource:            resource,
 		IntrospectionSecret: secret,
+		DatabasePath:        accountDatabasePath,
 		Accounts: []oauthserver.Account{
 			{TenantID: "acme", Username: "demo", Password: "demo"},
 			{TenantID: "globex", Username: "demo", Password: "demo"},
@@ -49,9 +58,13 @@ func main() {
 		TransactionTTL:  10 * time.Minute,
 	})
 	if err != nil {
-		slog.Error("create authorization server", "error", err)
-		os.Exit(1)
+		return err
 	}
+	defer func() {
+		if err := oauth.Close(); err != nil {
+			slog.Error("close account database", "error", err)
+		}
+	}()
 
 	mux := http.NewServeMux()
 	oauth.RegisterRoutes(mux)
@@ -66,22 +79,31 @@ func main() {
 		})
 	})
 
-	serve("authorization server", addr, mux)
+	return serve("authorization server", addr, mux)
 }
 
-func serve(name, addr string, handler http.Handler) {
+func serve(name, addr string, handler http.Handler) error {
 	server := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 2 * time.Minute}
-	go func() {
-		slog.Info(name+" started", "listen", "http://"+addr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("serve", "error", err)
-			os.Exit(1)
-		}
-	}()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	<-ctx.Done()
+	serveErr := make(chan error, 1)
+	go func() {
+		slog.Info(name+" started", "listen", "http://"+addr)
+		serveErr <- server.ListenAndServe()
+	}()
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = server.Shutdown(shutdownCtx)
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		_ = server.Close()
+		return err
+	}
+	return nil
 }

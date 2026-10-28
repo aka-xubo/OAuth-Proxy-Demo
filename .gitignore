@@ -1,1 +1,5 @@
 .DS_Store
+/oauth-users.db
+/oauth-users.db-journal
+/oauth-users.db-wal
+/oauth-users.db-shm
